@@ -5,7 +5,8 @@
 - pending：一方挂单（发起方默认已确认），等待对方确认，此阶段不占用任何配额；
 - confirmed：双方均确认，卖方账户把对应数量从“可用”转为交易占用 reserved；
 - delivered：交割完成。占用配额离开卖方持仓（current/reserved 同减），
-  买方持仓同额增加，双方各写一条流水；
+  买方持仓同额增加，双方各写一条流水；默认在同一事务内自动核销买方同年度
+  履约缺口（先冻结配额、后到账配额），履约状态与配额状态同步达标；
 - cancelled：交割前任一方撤销（含对方拒绝），释放卖方交易占用，状态终态。
 
 交易占用与履约冻结的冲突处理
@@ -49,6 +50,7 @@ from app.models.allowance import (
     TradeOrder,
 )
 from app.models.company import Company
+from app.services.quota_service import settle_buyer_deficit_on_delivery
 
 # 订单状态
 PENDING = "pending"
@@ -129,11 +131,16 @@ def create_order(
     tx_date: str = "",
     remark: str = "",
     idempotency_key: str | None = None,
+    auto_clear_deficit: bool = True,
 ) -> TradeOrder:
     """创建企业间交易订单（挂单）。
 
     挂单阶段不锁定配额；发起方默认已确认，对方确认时才占用卖方配额。
     携带相同 ``idempotency_key`` 的重复提交直接返回首笔订单。
+
+    ``auto_clear_deficit``（默认开启）：订单交割、买方配额到账后，在同一事务内
+    自动核销买方同年度履约缺口（先冻结配额、后到账可用配额），形成年度配额闭环；
+    显式置为 False 时仅完成交割，买方自行决定清缴时机。
     """
     if amount <= 0:
         raise TradeOrderError("交易数量必须为正数")
@@ -182,6 +189,7 @@ def create_order(
                     tx_date=tx_date or _today(),
                     remark=remark,
                     idempotency_key=idempotency_key,
+                    auto_clear_deficit=1 if auto_clear_deficit else 0,
                 )
                 db.add(order)
                 db.flush()
@@ -462,6 +470,14 @@ def deliver_order(db: Session, order_id: int, company_id: int) -> TradeOrder:
                     f"订单 {order.order_no} 交割，从{seller_name}受让 {amount} 吨",
                     order,
                 )
+
+                # 年度配额闭环：交割到账与买方履约缺口核销在同一事务完成。
+                # 锁集合已含买方 clear/account 键，核销先消化其已冻结配额，
+                # 再用刚到账的自由可用配额补缴缺口；任一步失败整笔交割回滚。
+                try:
+                    settle_buyer_deficit_on_delivery(db, order)
+                except ValueError as exc:
+                    raise TradeOrderError(f"交割联动履约核销失败，整笔交割已回滚：{exc}")
 
                 order.delivered_at = datetime.utcnow()
                 db.flush()

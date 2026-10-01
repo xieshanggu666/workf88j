@@ -5,7 +5,8 @@
 - allowance_transactions：idempotency_key、frozen_after、reserved_after、trade_order_id
 - allowance_accounts：reserved_balance（企业间订单交易占用）
 - compliance_records：idempotency_key、frozen_amount、report_id、is_active
-- trade_orders：企业间交易订单新表（建表由 SQLAlchemy 元数据完成，存在则跳过）
+- trade_orders：企业间交易订单新表（建表由 SQLAlchemy 元数据完成，存在则跳过）；
+  auto_clear_deficit 列控制交割时是否自动核销买方同年度履约缺口
 - mrv_reports：reversed_by/reversed_at/reversal_reason
 - 活跃履约记录保持 (company_id, year) 唯一；冲正归档记录可重新批准
 """
@@ -136,6 +137,16 @@ def main():
     if "quotas" in tables and not _has_index(inspector, "uq_quota_company_year"):
         statements.append(
             "CREATE UNIQUE INDEX uq_quota_company_year ON quotas (company_id, year)"
+        )
+
+    if "trade_orders" in tables:
+        # 交割闭环开关：存量订单默认开启“交割自动核销买方履约缺口”
+        _add_column(
+            statements,
+            inspector,
+            "trade_orders",
+            "auto_clear_deficit",
+            "auto_clear_deficit INTEGER NOT NULL DEFAULT 1",
         )
 
     if "mrv_reports" in tables:

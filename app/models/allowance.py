@@ -145,6 +145,8 @@ class TradeOrder(Base):
     cancel_reason = Column(String(256), nullable=False, default="")
     cancelled_by = Column(Integer, ForeignKey("companies.id"), nullable=True)
     idempotency_key = Column(String(64), nullable=True)
+    # 交割闭环开关：交割时用买方到账配额自动核销其同年度履约缺口（默认开启）
+    auto_clear_deficit = Column(Integer, nullable=False, default=1)
     confirmed_at = Column(DateTime, nullable=True)
     delivered_at = Column(DateTime, nullable=True)
     cancelled_at = Column(DateTime, nullable=True)

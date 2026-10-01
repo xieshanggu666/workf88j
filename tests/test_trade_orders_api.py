@@ -271,3 +271,99 @@ def test_list_orders_filter_by_status_and_year(ctx):
     assert len(res.json()) == 1
     assert client.get("/api/trade-orders?status=delivered").json() == []
     assert client.get("/api/trade-orders?year=2024").json() == []
+
+
+def _setup_buyer_deficit(c2_id, emission, factor=0.5703):
+    """通过 service 层构造买方年度缺口：活动数据→核算→报告批准（冻结+缺口）。"""
+    from app.models import ActivityData, CalculationMethod, EmissionFactor, EmissionScope
+    from app.core.database import SessionLocal
+    from app.services.calculation_service import recalc_company_year
+    from app.services.mrv_service import approve_report, generate_report, submit_report
+
+    db = next(app.dependency_overrides[get_db]())
+    db.add(EmissionScope(company_id=c2_id, scope="2", category="外购电力", name="厂区用电"))
+    db.add(CalculationMethod(
+        method_code="ELEC", name="外购电力排放因子法", scope="2", formula_type="activity_factor"))
+    db.add(EmissionFactor(
+        factor_code="ELEC-GRID", name="外购电力", scope="2", unit="tCO2/MWh", value=factor,
+        source="电网因子", valid_from="2024-01-01", valid_to="2025-12-31"))
+    db.flush()
+    scope_id = db.query(EmissionScope).filter_by(company_id=c2_id, scope="2").one().id
+    db.add(ActivityData(
+        company_id=c2_id, scope_id=scope_id, year=2025, period="monthly",
+        activity_type="外购电力", unit="MWh",
+        quantity=round(emission / factor, 6), data_source="台账", verified=1))
+    db.commit()
+    recalc_company_year(db, c2_id, 2025)
+    report = generate_report(db, c2_id, 2025)
+    submit_report(db, report)
+    approve_report(db, report, verifier_id=1)
+    db.commit()
+    db.close()
+
+
+def test_deliver_api_returns_buyer_clearance_and_closes_loop(ctx):
+    """交割接口返回买方履约核销结果，余额/履约/统计经 API 全部闭环。"""
+    client, ids = ctx
+    # 买方排放 600：配额 400 全冻结，缺口 200
+    _setup_buyer_deficit(ids["c2"], 600)
+
+    login(client, "ent1")
+    oid = client.post("/api/trade-orders", json={
+        "seller_id": ids["c1"], "buyer_id": ids["c2"], "year": 2025, "amount": 200,
+    }).json()["id"]
+    login(client, "ent2")
+    client.post(f"/api/trade-orders/{oid}/confirm")
+    login(client, "ent1")
+    res = client.post(f"/api/trade-orders/{oid}/deliver")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == DELIVERED
+    assert body["auto_clear_deficit"] is True
+    clearance = body["buyer_clearance"]
+    assert clearance is not None
+    assert clearance["status"] == "compliant"
+    assert clearance["cleared_amount"] == 600
+    assert clearance["frozen_amount"] == 0
+    assert clearance["deficit"] == 0
+
+    # 买方账户：400 + 200 - 600 清缴 = 0
+    login(client, "ent2")
+    acc = client.get(f"/api/companies/{ids['c2']}/account?year=2025").json()
+    assert acc["current_balance"] == 0
+    assert acc["frozen_balance"] == 0
+    compliance = client.get("/api/compliance?year=2025").json()
+    assert len(compliance) == 1
+    assert compliance[0]["status"] == "compliant"
+
+    # 仪表盘（企业视角）同步：已清缴 600、持仓 0、达标 1 家
+    stats = client.get("/api/dashboard/stats?year=2025").json()
+    assert stats["cleared_total"] == 600
+    assert stats["current_balance_total"] == 0
+    assert stats["compliance_counts"]["compliant"] == 1
+
+
+def test_create_order_with_auto_clear_disabled(ctx):
+    """挂单可显式关闭交割联动清缴；该订单交割后买方缺口保留。"""
+    client, ids = ctx
+    _setup_buyer_deficit(ids["c2"], 600)
+
+    login(client, "admin")
+    oid = client.post("/api/trade-orders", json={
+        "seller_id": ids["c1"], "buyer_id": ids["c2"], "year": 2025,
+        "amount": 200, "auto_clear_deficit": False,
+    }).json()["id"]
+    detail = client.get(f"/api/trade-orders/{oid}").json()
+    assert detail["auto_clear_deficit"] is False
+    login(client, "ent2")
+    client.post(f"/api/trade-orders/{oid}/confirm")
+    login(client, "admin")
+    res = client.post(f"/api/trade-orders/{oid}/deliver")
+    assert res.status_code == 200
+    assert res.json()["buyer_clearance"]["status"] == "deficit"
+
+    acc = client.get(f"/api/companies/{ids['c2']}/account?year=2025").json()
+    # 到账 200 留存为自由可用，冻结 400 不动，缺口仍是 200
+    assert acc["current_balance"] == 600
+    assert acc["frozen_balance"] == 400
+    assert acc["available_balance"] == 200

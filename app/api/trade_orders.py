@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_roles
-from app.models import Company, TradeOrder, User
+from app.models import Company, ComplianceRecord, TradeOrder, User
 from app.schemas import TradeOrderCancelIn, TradeOrderIn
 from app.services.trade_order_service import (
     TradeOrderError,
@@ -35,6 +35,7 @@ def _serialize(db: Session, order: TradeOrder) -> dict:
         "seller_confirmed": bool(order.seller_confirmed),
         "buyer_confirmed": bool(order.buyer_confirmed),
         "initiator": order.initiator,
+        "auto_clear_deficit": bool(getattr(order, "auto_clear_deficit", 1)),
         "tx_date": order.tx_date,
         "remark": order.remark,
         "cancel_reason": order.cancel_reason,
@@ -42,6 +43,29 @@ def _serialize(db: Session, order: TradeOrder) -> dict:
         "delivered_at": order.delivered_at,
         "cancelled_at": order.cancelled_at,
         "created_at": order.created_at,
+    }
+
+
+def _buyer_clearance(db: Session, order: TradeOrder) -> dict | None:
+    """交割响应附带的买方履约核销结果（无活跃履约记录则为 None）。"""
+    record = (
+        db.query(ComplianceRecord)
+        .filter(
+            ComplianceRecord.company_id == order.buyer_id,
+            ComplianceRecord.year == order.year,
+            ComplianceRecord.is_active == 1,
+        )
+        .first()
+    )
+    if record is None:
+        return None
+    return {
+        "id": record.id,
+        "status": record.status,
+        "verified_emission": float(record.verified_emission),
+        "cleared_amount": float(record.cleared_amount),
+        "frozen_amount": float(record.frozen_amount or 0),
+        "deficit": float(record.deficit),
     }
 
 
@@ -96,6 +120,7 @@ def create(
             data.tx_date,
             data.remark,
             idempotency_key=idem_key,
+            auto_clear_deficit=data.auto_clear_deficit,
         )
     except TradeOrderError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -162,4 +187,6 @@ def deliver(order_id: int, db: Session = Depends(get_db), user: User = Depends(r
         order = deliver_order(db, order_id, company_id)
     except TradeOrderError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return _serialize(db, order)
+    payload = _serialize(db, order)
+    payload["buyer_clearance"] = _buyer_clearance(db, order)
+    return payload

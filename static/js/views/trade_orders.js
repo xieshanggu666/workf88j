@@ -5,7 +5,7 @@ views.TradeOrdersView = () => {
   const [selStatus, setSelStatus] = React.useState("");
   const [form, setForm] = React.useState({
     seller_id: "", buyer_id: "", amount: "", price: "", year: 2025,
-    initiator: "seller", tx_date: "", remark: "",
+    initiator: "seller", tx_date: "", remark: "", autoClear: true,
   });
   const [msg, setMsg] = React.useState({ type: "", text: "" });
   const [submitting, setSubmitting] = React.useState(false);
@@ -61,6 +61,7 @@ views.TradeOrdersView = () => {
         initiator: form.initiator,
         tx_date: form.tx_date,
         remark: form.remark,
+        auto_clear_deficit: form.autoClear,
       }, api.idemKey());
       refresh("ok", `订单 ${r.order_no} 已创建，状态：${orderStatusMap[r.status][1]}`);
       setForm({ ...form, amount: "", price: "", tx_date: "", remark: "" });
@@ -75,7 +76,16 @@ views.TradeOrdersView = () => {
     if (needConfirm && !confirm(`确认对订单 ${o.order_no} 执行「${label}」？`)) return;
     try {
       const r = await api.post(`/api/trade-orders/${o.id}/${action}`, body, api.idemKey());
-      refresh("ok", `订单 ${r.order_no} 已${label}，当前状态：${orderStatusMap[r.status][1]}`);
+      let extra = "";
+      if (action === "deliver" && r.buyer_clearance) {
+        const c = r.buyer_clearance;
+        if (c.status === "compliant") {
+          extra = `；买方${r.year}年度履约已达标（累计清缴 ${fmtNum(c.cleared_amount, 4)} 吨）`;
+        } else {
+          extra = `；买方尚有缺口 ${fmtNum(c.deficit, 4)} 吨（已清缴 ${fmtNum(c.cleared_amount, 4)} 吨）`;
+        }
+      }
+      refresh("ok", `订单 ${r.order_no} 已${label}，当前状态：${orderStatusMap[r.status][1]}${extra}`);
     } catch (err) {
       setMsg({ type: "err", text: err.message });
     }
@@ -128,13 +138,21 @@ views.TradeOrdersView = () => {
         <div class="field"><label>成交日期</label>
           <input value=${form.tx_date} onChange=${set("tx_date")} placeholder=${now} /></div>
         <div class="field"><label>备注</label><input value=${form.remark} onChange=${set("remark")} /></div>
+        <div class="field"><label>交割后履约</label>
+          <label style=${{display: "flex", alignItems: "center", gap: "6px", fontWeight: "normal"}}>
+            <input type="checkbox" checked=${form.autoClear}
+              onChange=${(e) => setForm({ ...form, autoClear: e.target.checked })} />
+            交割到账自动清缴买方${form.year}年度缺口
+          </label>
+        </div>
         <div class="actions"><button class="btn" type="submit" disabled=${submitting}>
           ${submitting ? "提交中…" : "创建订单（发起方即确认）"}
         </button></div>
       </form>
       <div class="empty" style=${{textAlign: "left", marginTop: "8px"}}>
         双方确认后，卖方相应配额将转为<b>交易占用</b>（不影响持仓，但不可卖出/划出/被履约冻结）；
-        交割时划转给买方。交割前任一方可撤销，占用自动释放。
+        交割时划转给买方，并在同一事务内自动核销买方同年度履约缺口（先冻结核销、后到账补缴），
+        履约状态与统计同步更新。交割前任一方可撤销，占用自动释放。
       </div>
     </div>
 
@@ -160,7 +178,7 @@ views.TradeOrdersView = () => {
       <table>
         <thead><tr>
           <th>订单号</th><th>年度</th><th>卖方</th><th>买方</th><th>数量 (t)</th><th>单价</th>
-          <th>卖方确认</th><th>买方确认</th><th>状态</th><th>操作</th>
+          <th>卖方确认</th><th>买方确认</th><th>状态</th><th>履约闭环</th><th>操作</th>
         </tr></thead>
         <tbody>
           ${orders.map((o) => {
@@ -178,6 +196,7 @@ views.TradeOrdersView = () => {
               <td>${o.seller_confirmed ? "✓" : "—"}</td>
               <td>${o.buyer_confirmed ? "✓" : "—"}</td>
               <td>${html([StatusBadge(o.status)])}${o.cancel_reason ? html`<div class="muted" style=${{fontSize: "12px"}}>${o.cancel_reason}</div>` : ""}</td>
+              <td>${o.auto_clear_deficit ? html`<span title="交割时自动核销买方同年度履约缺口">清缴联动</span>` : html`<span class="muted">不联动</span>`}</td>
               <td style=${{whiteSpace: "nowrap"}}>
                 ${canWrite && o.status === "pending" && !iConfirmed && html`
                   <button class="btn sm" onClick=${() => act(o, "confirm", "确认", false)}>确认</button>`}
@@ -193,7 +212,7 @@ views.TradeOrdersView = () => {
               </td>
             </tr>`;
           })}
-          ${orders.length === 0 && html`<tr><td colspan="10" class="empty">暂无交易订单</td></tr>`}
+          ${orders.length === 0 && html`<tr><td colspan="11" class="empty">暂无交易订单</td></tr>`}
         </tbody>
       </table>
     </div>

@@ -72,6 +72,8 @@ class TradeOrderIn(BaseModel):
     tx_date: str = ""
     remark: str = ""
     idempotency_key: str | None = None
+    # 交割时是否自动用买方到账配额核销其同年度履约缺口（默认开启，年度配额闭环）
+    auto_clear_deficit: bool = True
 
 
 class TradeOrderCancelIn(BaseModel):

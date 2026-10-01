@@ -113,9 +113,9 @@ def _lock_keys_for(
     return keys
 
 
-def _gen_order_no(db: Session, year: int) -> str:
-    count = db.query(TradeOrder).filter(TradeOrder.year == year).count()
-    return f"TO{year}{count + 1:06d}"
+def _gen_order_no(order_id: int, year: int) -> str:
+    """由全局唯一自增 id 派生单号：并发挂单无需跨企业计数，天然无撞号竞态。"""
+    return f"TO{year}{order_id:06d}"
 
 
 def create_order(
@@ -169,7 +169,9 @@ def create_order(
         try:
             with transactional(db):
                 order = TradeOrder(
-                    order_no=_gen_order_no(db, year),
+                    # 单号占位：先 flush 取全局唯一自增 id，再派生正式单号，
+                    # 避免跨企业对并发挂单时 count+1 计数撞唯一约束
+                    order_no="",
                     year=year,
                     seller_id=seller_id,
                     buyer_id=buyer_id,
@@ -184,6 +186,8 @@ def create_order(
                     idempotency_key=idempotency_key,
                 )
                 db.add(order)
+                db.flush()
+                order.order_no = _gen_order_no(order.id, year)
                 db.flush()
                 db.refresh(order)
         except IntegrityError as exc:

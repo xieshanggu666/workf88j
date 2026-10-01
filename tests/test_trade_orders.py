@@ -10,6 +10,9 @@
 - 幂等建单；重复交割/重复撤销幂等；非法状态流转被拒绝；
 - 多线程并发：重复交割只入账一次、交割与撤销竞争不产生脏账、
   同一卖方并发确认多张订单总占用不超过可用余额；
+- 跨企业对并发挂单：单号由全局唯一 id 派生，无 count+1 撞号；
+- 年度配额闭环：买方缺口经订单交割到账后补缴达标，余额/统计/履约状态一致；
+- 交割与买方补缴并发：任一顺序下账户守恒、履约记录与流水三方一致；
 - 流水快照链（持仓/冻结/占用）逐笔可推算。
 """
 
@@ -770,5 +773,200 @@ class TestOrderConcurrency:
         assert float(seller_acc.frozen_balance) + float(seller_acc.reserved_balance) <= float(
             seller_acc.current_balance
         ) + 1e-9
+        _assert_snapshot(db, seller_acc.id)
+        _assert_snapshot(db, buyer_acc.id)
+
+
+def _prepare_buyer_deficit(db, ctx, emission=900.0):
+    """构造买方履约缺口：排放 emission 吨、配额 400 吨，批准冻结并首缴后留缺口。
+
+    返回 (履约记录, 买方账户)。买方持仓 400 全部冻结并核销，cleared=400，
+    deficit=emission-400，账户 current=0。
+    """
+    buyer = ctx["buyer"]
+    db.add(
+        EmissionScope(company_id=buyer.id, scope="2", category="外购电力", name="厂区用电")
+    )
+    db.flush()
+    scope_id = (
+        db.query(EmissionScope)
+        .filter(EmissionScope.company_id == buyer.id, EmissionScope.scope == "2")
+        .first()
+        .id
+    )
+    db.add(
+        ActivityData(
+            company_id=buyer.id, scope_id=scope_id, year=2025,
+            period="monthly", activity_type="外购电力", unit="MWh",
+            quantity=round(emission / 0.5703, 6), data_source="台账", verified=1,
+        )
+    )
+    db.commit()
+    from app.services.calculation_service import recalc_company_year
+
+    recalc_company_year(db, buyer.id, 2025)
+    report = generate_report(db, buyer.id, 2025)
+    submit_report(db, report)
+    approve_report(db, report, verifier_id=1)
+    record = clear_emission(db, buyer.id, 2025, "2025-12-31")
+    assert record.status == "deficit"
+    assert float(record.cleared_amount) == approx(400)
+    _, buyer_acc = _accounts(db, ctx)
+    assert float(buyer_acc.current_balance) == approx(0)
+    return record, buyer_acc
+
+
+class TestClosedLoop:
+    """年度配额闭环：缺口企业经企业间订单买入 → 交割到账 → 补缴达标，全链路一致。"""
+
+    def test_delivery_closes_buyer_deficit_loop(self, db, two_companies):
+        """买方缺口 500 吨：订单交割 600 吨到账后补缴，履约转达标，余额/统计/状态一致。"""
+        from app.models import ComplianceRecord, Quota
+        from app.services.stats_service import dashboard_stats
+
+        ctx = two_companies
+        seller, buyer = ctx["seller"], ctx["buyer"]
+        record, _ = _prepare_buyer_deficit(db, ctx, emission=900.0)
+        emission = float(record.verified_emission)
+
+        # 买方通过企业间订单向卖方买入 600 吨并完成交割
+        order = create_order(db, seller.id, buyer.id, 2025, 600, price=75)
+        confirm_order(db, order.id, buyer.id)
+        order = deliver_order(db, order.id, seller.id)
+        assert order.status == DELIVERED
+
+        db.expire_all()
+        seller_acc, buyer_acc = _accounts(db, ctx)
+        assert float(seller_acc.current_balance) == approx(400)
+        assert float(buyer_acc.current_balance) == approx(600)
+
+        # 交割到账后补缴缺口：仅扣剩余缺口，履约记录转达标
+        record = clear_emission(db, buyer.id, 2025, "2025-12-31")
+        assert record.status == "compliant"
+        assert float(record.cleared_amount) == approx(emission)
+        assert float(record.deficit) == 0
+
+        db.expire_all()
+        seller_acc, buyer_acc = _accounts(db, ctx)
+        # 买方：到账 600 - 补缴 (emission-400)，余额约 100；冻结/占用归零
+        assert float(buyer_acc.current_balance) == approx(600 - (emission - 400))
+        assert float(buyer_acc.frozen_balance) == 0
+        assert float(buyer_acc.reserved_balance) == 0
+        assert float(seller_acc.current_balance) == approx(400)
+
+        # 配额状态随履约闭环流转为已清缴
+        quota = db.query(Quota).filter_by(company_id=buyer.id, year=2025).one()
+        assert quota.status == "cleared"
+
+        # 统计与账户实时一致：可用 = 持仓 - 冻结 - 占用，清缴合计等于批准排放量
+        stats = dashboard_stats(db, 2025)
+        assert stats["cleared_total"] == approx(emission)
+        assert stats["compliance_counts"]["compliant"] == 1
+        assert stats["compliance_counts"]["deficit"] == 0
+        assert stats["current_balance_total"] == approx(
+            float(seller_acc.current_balance) + float(buyer_acc.current_balance)
+        )
+        assert stats["available_total"] == approx(stats["current_balance_total"])
+        assert stats["reserved_total"] == 0
+
+        _assert_snapshot(db, seller_acc.id)
+        _assert_snapshot(db, buyer_acc.id)
+
+
+class TestOrderCreationConcurrency:
+    def test_parallel_create_orders_unique_order_no(self, db, two_companies):
+        """不同企业对并发挂单：全部成功且单号唯一（回归：count+1 撞唯一约束）。"""
+        ctx = two_companies
+        extra = []
+        for i in (3, 4):
+            c = Company(code=f"C-00{i}", name=f"企业{i}", industry="化工", region="华南")
+            db.add(c)
+            db.flush()
+            allocate_quota(db, c.id, 2025, 1000, 1000, 0)
+            extra.append(c)
+        db.commit()
+        pairs = [(ctx["seller"].id, ctx["buyer"].id), (extra[0].id, extra[1].id)] * 4
+        errors = []
+
+        def worker(pair):
+            session = _fresh_session(db)
+            try:
+                o = create_order(session, pair[0], pair[1], 2025, 100)
+                return o.id, o.order_no
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+                return None
+            finally:
+                session.close()
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(worker, pairs))
+
+        db.expire_all()
+        assert not errors, f"并发挂单出现非预期异常：{errors!r}"
+        assert all(r is not None for r in results)
+        order_nos = [r[1] for r in results]
+        assert len(set(order_nos)) == 8
+        assert all(no.startswith("TO2025") for no in order_nos)
+        assert db.query(TradeOrder).count() == 8
+
+
+class TestDeliveryClearConcurrency:
+    def test_delivery_races_buyer_clear(self, db, two_companies):
+        """买方交割入账与缺口补缴并发：任一顺序下余额、履约记录与流水三方一致。"""
+        from app.models import ComplianceRecord
+
+        ctx = two_companies
+        seller, buyer = ctx["seller"], ctx["buyer"]
+        record, _ = _prepare_buyer_deficit(db, ctx, emission=900.0)
+        emission = float(record.verified_emission)
+
+        order = create_order(db, seller.id, buyer.id, 2025, 600)
+        confirm_order(db, order.id, buyer.id)
+        db.commit()
+        order_id = order.id
+        errors = []
+
+        def deliver():
+            session = _fresh_session(db)
+            try:
+                deliver_order(session, order_id, seller.id)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(("deliver", exc))
+            finally:
+                session.close()
+
+        def clear():
+            session = _fresh_session(db)
+            try:
+                clear_emission(session, buyer.id, 2025, "2025-12-31")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(("clear", exc))
+            finally:
+                session.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(lambda f: f(), [deliver, clear]))
+
+        db.expire_all()
+        assert not errors, f"并发出现非预期异常：{errors!r}"
+        seller_acc, buyer_acc = _accounts(db, ctx)
+        record = (
+            db.query(ComplianceRecord)
+            .filter_by(company_id=buyer.id, year=2025, is_active=1)
+            .one()
+        )
+        cleared = float(record.cleared_amount)
+        # 先交割后补缴：cleared=emission 达标，买方余额 100；
+        # 先补缴后交割：可用为 0 扣不到，cleared 仍 400，买方余额 600，留缺口待补缴
+        assert cleared in (pytest.approx(400), pytest.approx(emission))
+        # 买方账户守恒：到账 600 中未被清缴的部分即余额
+        assert float(buyer_acc.current_balance) == approx(1000 - cleared)
+        assert float(record.deficit) == approx(max(emission - cleared, 0.0))
+        assert record.status == ("compliant" if float(record.deficit) <= 0 else "deficit")
+        # 卖方交割出库完成，占用归零
+        assert float(seller_acc.current_balance) == approx(400)
+        assert float(seller_acc.reserved_balance) == 0
+        assert float(buyer_acc.reserved_balance) == 0
         _assert_snapshot(db, seller_acc.id)
         _assert_snapshot(db, buyer_acc.id)
